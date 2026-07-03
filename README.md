@@ -183,17 +183,62 @@ even when DKMS is installed correctly.
 
 From your [OmenCore](https://github.com/theantipopau/omencore) checkout:
 
+Install the helper script and udev rule (the rule calls the script on module load):
+
 ```bash
+sudo mkdir -p /usr/local/lib/omencore
+sudo cp scripts/init-fourzone-keyboard.sh /usr/local/lib/omencore/
+sudo chmod +x /usr/local/lib/omencore/init-fourzone-keyboard.sh
 sudo cp scripts/99-omencore-hp-wmi.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=platform --action=change
 ```
+
+If you build OmenCore with `build.sh`, it installs both files automatically.
 
 Verify permissions (should show `666` after the rule runs):
 
 ```bash
 ls -l /sys/devices/platform/hp-wmi/fourzone_*
 ```
+
+### Hardware brightness gate (`fourzone_brightness`)
+
+Four-zone keyboards use **two** sysfs controls:
+
+| Node | Purpose |
+|------|---------|
+| `fourzone_color` | Per-zone RGB (24 hex chars: 4 zones × RRGGBB) |
+| `fourzone_brightness` | Hardware brightness gate (0–255) |
+
+Firmware often boots with `fourzone_brightness = 0` on a fresh distro install
+(Fedora, Debian, Pika OS, etc.). Color writes succeed and OmenCore may report
+success while the keyboard stays physically off. This is **not** a udev failure —
+check brightness before blaming permissions.
+
+```bash
+cat /sys/devices/platform/hp-wmi/fourzone_brightness
+cat /sys/devices/platform/hp-wmi/fourzone_color
+```
+
+Fix manually:
+
+```bash
+echo 255 | sudo tee /sys/devices/platform/hp-wmi/fourzone_brightness
+omencore-cli keyboard --color 00BFFF
+```
+
+Or via OmenCore:
+
+```bash
+omencore-cli keyboard --brightness 100
+omencore-cli keyboard --color 00BFFF
+```
+
+`init-fourzone-keyboard.sh` (installed with the udev rule) raises
+`fourzone_brightness` from `0` to `255` when the `hp-wmi` platform device
+appears. Set `OMENCORE_SKIP_BRIGHTNESS_INIT=1` to chmod only and preserve an
+intentional off state.
 
 ### Quick sysfs test
 
@@ -242,18 +287,27 @@ sudo modprobe hp_wmi   # loads the stock in-tree module, if present
    modinfo -n hp_wmi
    ls /sys/devices/platform/hp-wmi/fourzone_*
    ```
-2. **Check sysfs permissions** — if files are `-rw-r--r-- root root`, install
-   the udev rule in [OmenCore and keyboard lighting](#omencore-and-keyboard-lighting)
+2. **Check `fourzone_brightness`** — if it is `0`, the hardware gate is off even
+   when colors are set. See [Hardware brightness gate](#hardware-brightness-gate-fourzone_brightness).
+   ```bash
+   cat /sys/devices/platform/hp-wmi/fourzone_brightness
+   echo 255 | sudo tee /sys/devices/platform/hp-wmi/fourzone_brightness
+   ```
+3. **Check sysfs permissions** — if files are `-rw-r--r-- root root`, install
+   the udev rule and `init-fourzone-keyboard.sh` in
+   [OmenCore and keyboard lighting](#omencore-and-keyboard-lighting)
    or use `sudo` / `pkexec`.
-3. **Reload the module** after DKMS install:
+4. **Reload the module** after DKMS install:
    ```bash
    sudo modprobe -r hp_wmi && sudo modprobe hp_wmi
    ```
-4. **Test outside OmenCore**:
+5. **Test outside OmenCore**:
    ```bash
+   echo 255 | sudo tee /sys/devices/platform/hp-wmi/fourzone_brightness
    echo "FF0000FF0000FF0000FF0000" | sudo tee /sys/devices/platform/hp-wmi/fourzone_color
    ```
-   If that works but OmenCore does not, the issue is permissions, not the driver.
+   If sysfs works but OmenCore GUI does not, re-check the udev rule. If color
+   writes work but the keyboard stays dark, brightness is almost certainly `0`.
 
 ### DKMS build fails
 
@@ -263,6 +317,7 @@ Ensure headers match the running kernel:
 uname -r
 dpkg -l "linux-headers-$(uname -r)"   # Debian/Pika OS
 pacman -Q "linux-headers-$(uname -r)" # Arch/CachyOS
+rpm -q "kernel-devel-$(uname -r)"     # Fedora
 ```
 
 ## Platform profile values
