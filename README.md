@@ -104,19 +104,35 @@ git diff cef99c0..HEAD -- hp-wmi.c
 - Root access to load kernel modules
 
 Supported distributions: any distro with DKMS (Arch, CachyOS, Fedora, Ubuntu,
-Debian, etc.).
+Debian, Pika OS, etc.).
+
+### Distribution packages
+
+**Debian / Ubuntu / Pika OS:**
+
+```bash
+sudo apt update
+sudo apt install dkms build-essential linux-headers-$(uname -r)
+```
+
+**Arch / CachyOS:**
+
+```bash
+sudo pacman -S dkms linux-headers
+```
 
 ## Installation
 
-Clone this repository and install with DKMS:
+Clone this repository and install with DKMS. The package version is defined in
+`dkms.conf` (currently **1.1.0** — use that version in all `dkms` commands):
 
 ```bash
 git clone https://github.com/saikiran2001-v2/hp-omen-dkms.git omen-dkms
 cd omen-dkms
 
 sudo dkms add .
-sudo dkms build hp-wmi/1.0.0
-sudo dkms install hp-wmi/1.0.0
+sudo dkms build hp-wmi/1.1.0
+sudo dkms install hp-wmi/1.1.0
 ```
 
 Reload the module:
@@ -124,6 +140,13 @@ Reload the module:
 ```bash
 sudo modprobe -r hp_wmi
 sudo modprobe hp_wmi
+```
+
+Confirm the DKMS build is active (not the stock in-tree module):
+
+```bash
+modinfo -n hp_wmi
+# expected: /lib/modules/$(uname -r)/updates/dkms/hp-wmi.ko
 ```
 
 Verify platform profile registration:
@@ -145,14 +168,60 @@ Verify hwmon fan interface:
 ls /sys/devices/platform/hp-wmi/hwmon/hwmon*/pwm1_enable
 ```
 
+## OmenCore and keyboard lighting
+
+The DKMS module exposes `fourzone_color`, `fourzone_brightness`, and
+`fourzone_animation` under `/sys/devices/platform/hp-wmi/`. The driver is only
+half the story: those sysfs files are created as **root-owned and not writable
+by your desktop user**. OmenCore (GUI and CLI) writes to them directly.
+
+On CachyOS you may have had the OmenCore udev rule installed already. On a
+fresh Debian/Pika OS install it is usually missing, so lighting appears broken
+even when DKMS is installed correctly.
+
+### Install the OmenCore udev rule (recommended for GUI)
+
+From your [OmenCore](https://github.com/theantipopau/omencore) checkout:
+
+```bash
+sudo cp scripts/99-omencore-hp-wmi.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=platform --action=change
+```
+
+Verify permissions (should show `666` after the rule runs):
+
+```bash
+ls -l /sys/devices/platform/hp-wmi/fourzone_*
+```
+
+### Quick sysfs test
+
+```bash
+# read current colors (24 hex chars)
+cat /sys/devices/platform/hp-wmi/fourzone_color
+
+# set all zones to OMEN blue (needs root OR the udev rule above)
+echo "00BFFF00BFFF00BFFF00BFFF" | sudo tee /sys/devices/platform/hp-wmi/fourzone_color
+```
+
+### OmenCore without udev rules
+
+Run CLI commands with sudo, or launch the GUI elevated:
+
+```bash
+sudo omencore-cli keyboard --color 00BFFF
+pkexec omencore-gui
+```
+
 ## Updating
 
 After pulling new changes:
 
 ```bash
-sudo dkms remove hp-wmi/1.0.0 --all
+sudo dkms remove hp-wmi/1.1.0 --all
 sudo dkms add .
-sudo dkms install hp-wmi/1.0.0
+sudo dkms install hp-wmi/1.1.0
 sudo modprobe -r hp_wmi && sudo modprobe hp_wmi
 ```
 
@@ -160,8 +229,40 @@ sudo modprobe -r hp_wmi && sudo modprobe hp_wmi
 
 ```bash
 sudo modprobe -r hp_wmi
-sudo dkms remove hp-wmi/1.0.0 --all
+sudo dkms remove hp-wmi/1.1.0 --all
 sudo modprobe hp_wmi   # loads the stock in-tree module, if present
+```
+
+## Troubleshooting
+
+### Keyboard lighting does nothing in OmenCore
+
+1. **Confirm DKMS module is loaded** (not stock `hp_wmi`):
+   ```bash
+   modinfo -n hp_wmi
+   ls /sys/devices/platform/hp-wmi/fourzone_*
+   ```
+2. **Check sysfs permissions** — if files are `-rw-r--r-- root root`, install
+   the udev rule in [OmenCore and keyboard lighting](#omencore-and-keyboard-lighting)
+   or use `sudo` / `pkexec`.
+3. **Reload the module** after DKMS install:
+   ```bash
+   sudo modprobe -r hp_wmi && sudo modprobe hp_wmi
+   ```
+4. **Test outside OmenCore**:
+   ```bash
+   echo "FF0000FF0000FF0000FF0000" | sudo tee /sys/devices/platform/hp-wmi/fourzone_color
+   ```
+   If that works but OmenCore does not, the issue is permissions, not the driver.
+
+### DKMS build fails
+
+Ensure headers match the running kernel:
+
+```bash
+uname -r
+dpkg -l "linux-headers-$(uname -r)"   # Debian/Pika OS
+pacman -Q "linux-headers-$(uname -r)" # Arch/CachyOS
 ```
 
 ## Platform profile values
