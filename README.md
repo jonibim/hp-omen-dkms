@@ -16,6 +16,7 @@ This fork is developed and tested primarily on:
 |----------|---------------|-------|
 | `8D40` | OMEN Slim 16-an0xxx / 16-an0015tx | Victus-S thermal path, four-zone RGB, improved fan AUTO handoff |
 | `8E35` | HP OMEN 16 | Four-zone RGB, GPU thermal mode probing |
+| `8C2F` | HP Victus 15-fb2xxx (AMD) | Victus-S thermal path; EC readback confirmed at offset `0x95` by live testing. Four-zone sysfs nodes exist but this board has no 4-zone RGB keyboard, so they're non-functional. |
 
 Other boards already supported by the imported upstream driver may work unchanged.
 Adding a board ID requires confirming the correct thermal profile table and
@@ -33,6 +34,20 @@ This repository is based on the Linux kernel `hp-wmi` driver (imported at
   hwmon path on OMEN Slim 16 hardware.
 - Added `8E35` to `omen_thermal_profile_boards` and
   `omen_timed_thermal_profile_boards` where missing from the imported base.
+- Added DMI board `8C2F` (HP Victus 15-fb2xxx AMD) to
+  `victus_s_thermal_profile_boards` with a new `victus_s_amd_thermal_params`.
+
+### Battery charge control (standard power_supply ABI)
+
+Added HP's "Battery Health Manager" mechanism (WMI command `0x2B`,
+`GBCO`/`SBCO`), gated to DMI board `8C2F`. Exposed through the standard
+Linux `power_supply` ABI on the real `BAT0` device via `devm_battery_hook_register()`: `charge_behaviour`
+(`auto`/`inhibit-charge`/`force-discharge`) and
+`charge_control_end_threshold` (percentage cap).
+
+```bash
+echo 80 | sudo tee /sys/class/power_supply/BAT0/charge_control_end_threshold
+```
 
 ### Four-zone keyboard backlight (sysfs)
 

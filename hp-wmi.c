@@ -13,7 +13,9 @@
 
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+ #include <acpi/battery.h>
  #include <linux/acpi.h>
+ #include <linux/bitops.h>
  #include <linux/cleanup.h>
  #include <linux/compiler_attributes.h>
  #include <linux/delay.h>
@@ -138,6 +140,13 @@
 	 .low_power	= HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
 	 .ec_tp_offset	= HP_NO_THERMAL_PROFILE_OFFSET,
  };
+
+ static const struct thermal_profile_params victus_s_amd_thermal_params = {
+	 .performance	= HP_VICTUS_S_THERMAL_PROFILE_PERFORMANCE,
+	 .balanced	= HP_VICTUS_S_THERMAL_PROFILE_DEFAULT,
+	 .low_power	= HP_VICTUS_S_THERMAL_PROFILE_DEFAULT,
+	 .ec_tp_offset	= HP_OMEN_EC_THERMAL_PROFILE_OFFSET,
+ };
  
  /*
   * A generic pointer for the currently-active board's thermal profile
@@ -240,6 +249,10 @@
 		 .driver_data = (void *)&victus_s_thermal_params,
 	 },
 	 {
+		 .matches = { DMI_MATCH(DMI_BOARD_NAME, "8C2F") },
+		 .driver_data = (void *)&victus_s_amd_thermal_params,
+	 },
+	 {
 		 .matches = { DMI_MATCH(DMI_BOARD_NAME, "8C76") },
 		 .driver_data = (void *)&omen_v1_thermal_params,
 	 },
@@ -335,6 +348,7 @@
 	 HPWMI_HARDWARE_QUERY		= 0x04,
 	 HPWMI_WIRELESS_QUERY		= 0x05,
 	 HPWMI_BATTERY_QUERY		= 0x07,
+	 HPWMI_BATTERY_CHARGE_OPTION_QUERY = 0x2B,
 	 HPWMI_BIOS_QUERY		= 0x09,
 	 HPWMI_FEATURE_QUERY		= 0x0b,
 	 HPWMI_HOTKEY_QUERY		= 0x0c,
@@ -664,7 +678,312 @@
 	 kfree(args);
 	 return ret;
  }
- 
+
+ /* Battery charge control (WMI command 0x2B, GBCO/SBCO in the DSDT), parameterized per board. */
+ struct battery_charge_params {
+	 u32 commandtype;
+	 u8 mode_auto;
+	 u8 mode_inhibit;
+	 u8 mode_force_discharge;
+	 u8 readback_inhibited;
+ };
+
+ static const struct battery_charge_params battery_charge_gbco_params = {
+	 .commandtype		= HPWMI_BATTERY_CHARGE_OPTION_QUERY,
+	 .mode_auto		= 0x00,
+	 .mode_force_discharge	= 0x02,
+	 .mode_inhibit		= 0x05,
+	 .readback_inhibited	= 0x04,
+ };
+
+ /* DMI board names confirmed to support a battery_charge_params mechanism. */
+ static const struct dmi_system_id hp_wmi_charge_control_quirks[] __initconst = {
+	 {
+		 .matches = { DMI_MATCH(DMI_BOARD_NAME, "8C2F") },
+		 .driver_data = (void *)&battery_charge_gbco_params,
+	 },
+	 {},
+ };
+ static const struct battery_charge_params *active_charge_params;
+
+ static int hp_wmi_get_battery_charge_option(u8 *mode)
+ {
+	 u8 data[4] = {};
+	 int ret;
+
+	 if (!active_charge_params)
+		 return -ENODEV;
+
+	 ret = hp_wmi_perform_query(active_charge_params->commandtype, HPWMI_READ,
+					data, zero_if_sup(data), sizeof(data));
+	 if (ret < 0)
+		 return ret;
+
+	 *mode = data[0];
+	 return 0;
+ }
+
+ static int hp_wmi_set_battery_charge_option(u8 mode)
+ {
+	 u8 data[4] = { 0, mode, 0, 0 };
+
+	 if (!active_charge_params)
+		 return -ENODEV;
+
+	 return hp_wmi_perform_query(active_charge_params->commandtype, HPWMI_WRITE,
+					 data, sizeof(data), 0);
+ }
+
+ /*
+  * The EC has no native percentage register, so CHARGE_CONTROL_END_THRESHOLD
+  * is enforced here by polling capacity and toggling FULL/INHIBIT.
+  */
+ #define HP_WMI_CHARGE_POLL_SECS	60
+ #define HP_WMI_CHARGE_HYSTERESIS	3
+
+ static DEFINE_MUTEX(hp_wmi_charge_lock);
+ /* 0 = disabled (normal full charge), 20-99 = target charge threshold percent */
+ static u8 hp_wmi_charge_end_threshold;
+ static struct delayed_work hp_wmi_charge_poll_work;
+ /* Cached by the battery hook while a BAT0-like device is attached. */
+ static struct power_supply *hp_wmi_charge_battery;
+
+ static int hp_wmi_charge_apply_threshold(void)
+ {
+	 int capacity;
+	 bool currently_inhibited;
+	 bool want_inhibit;
+	 u8 mode;
+	 int ret;
+
+	 guard(mutex)(&hp_wmi_charge_lock);
+
+	 if (!hp_wmi_charge_battery)
+		 return -ENODEV;
+
+	 /* Re-check live state every time -- a cached flag can drift out of sync. */
+	 ret = hp_wmi_get_battery_charge_option(&mode);
+	 if (ret < 0)
+		 return ret;
+	 currently_inhibited = mode == active_charge_params->readback_inhibited;
+
+	 /* Skip entirely while on battery -- inhibiting here corrupts _BST reporting. */
+	 if (power_supply_is_system_supplied() <= 0) {
+		 if (!currently_inhibited)
+			 return 0;
+
+		 return hp_wmi_set_battery_charge_option(active_charge_params->mode_auto);
+	 }
+
+	 if (!hp_wmi_charge_end_threshold) {
+		 want_inhibit = false;
+	 } else {
+		 union power_supply_propval val;
+
+		 ret = power_supply_get_property(hp_wmi_charge_battery,
+						 POWER_SUPPLY_PROP_CAPACITY, &val);
+		 if (ret)
+			 return ret;
+		 capacity = val.intval;
+
+		 if (currently_inhibited)
+			 want_inhibit = capacity > (int)hp_wmi_charge_end_threshold - HP_WMI_CHARGE_HYSTERESIS;
+		 else
+			 want_inhibit = capacity >= hp_wmi_charge_end_threshold;
+	 }
+
+	 if (want_inhibit == currently_inhibited)
+		 return 0;
+
+	 return hp_wmi_set_battery_charge_option(want_inhibit ?
+						 active_charge_params->mode_inhibit :
+						 active_charge_params->mode_auto);
+ }
+
+ static void hp_wmi_charge_poll_fn(struct work_struct *work)
+ {
+	 hp_wmi_charge_apply_threshold();
+
+	 if (hp_wmi_charge_end_threshold)
+		 schedule_delayed_work(&hp_wmi_charge_poll_work,
+					secs_to_jiffies(HP_WMI_CHARGE_POLL_SECS));
+ }
+
+ /*
+  * Shared by the CHARGE_CONTROL_END_THRESHOLD property and the
+  * battery_charge_threshold module parameter (applied once at load, for
+  * persistence across reboots via a modprobe.d options line) so there is a
+  * single validated path that actually talks to the EC.
+  */
+ static int hp_wmi_charge_set_threshold(u8 value)
+ {
+	 int ret;
+
+	 cancel_delayed_work_sync(&hp_wmi_charge_poll_work);
+
+	 scoped_guard(mutex, &hp_wmi_charge_lock)
+		 hp_wmi_charge_end_threshold = value;
+
+	 ret = hp_wmi_charge_apply_threshold();
+
+	 /*
+	  * Reschedule regardless of the immediate result (e.g. -ENODEV if the
+	  * battery hasn't attached yet at boot) so a transient failure is
+	  * retried instead of leaving the threshold permanently unenforced.
+	  */
+	 if (value)
+		 schedule_delayed_work(&hp_wmi_charge_poll_work,
+					secs_to_jiffies(HP_WMI_CHARGE_POLL_SECS));
+
+	 return ret;
+ }
+
+ /*
+  * -1 = unset (leave charging as the firmware has it). 0 or 20-100 applies
+  * that threshold once at module load, through the same validated path as
+  * the CHARGE_CONTROL_END_THRESHOLD property. Change it live via the
+  * standard power_supply property instead of rewriting this parameter after
+  * load (its own /sys/module/hp_wmi/parameters/ node is read-only).
+  */
+ static int battery_charge_threshold_param = -1;
+ module_param_named(battery_charge_threshold, battery_charge_threshold_param, int, 0444);
+ MODULE_PARM_DESC(battery_charge_threshold,
+		  "Battery charge threshold percent to apply at module load (0 or 20-100; 0/100 = disabled). Unset (-1) by default -- set via /etc/modprobe.d for persistence. Use the standard charge_control_end_threshold power_supply property to change it at runtime.");
+
+ static const enum power_supply_property hp_wmi_charge_ext_props[] = {
+	 POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+	 POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+ };
+
+ static int hp_wmi_charge_ext_get_property(struct power_supply *psy,
+					   const struct power_supply_ext *ext,
+					   void *data,
+					   enum power_supply_property psp,
+					   union power_supply_propval *val)
+ {
+	 u8 mode;
+	 int ret;
+
+	 switch (psp) {
+	 case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		 ret = hp_wmi_get_battery_charge_option(&mode);
+		 if (ret < 0)
+			 return ret;
+
+		 if (mode == active_charge_params->readback_inhibited)
+			 val->intval = POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+		 else if (mode == active_charge_params->mode_force_discharge)
+			 val->intval = POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE;
+		 else
+			 val->intval = POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		 return 0;
+	 case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		 val->intval = hp_wmi_charge_end_threshold ? hp_wmi_charge_end_threshold : 100;
+		 return 0;
+	 default:
+		 return -EINVAL;
+	 }
+ }
+
+ static int hp_wmi_charge_ext_set_property(struct power_supply *psy,
+					   const struct power_supply_ext *ext,
+					   void *data,
+					   enum power_supply_property psp,
+					   const union power_supply_propval *val)
+ {
+	 switch (psp) {
+	 case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		 /*
+		  * An explicit behaviour override disables threshold
+		  * enforcement, since the poll would otherwise fight it
+		  * within HP_WMI_CHARGE_POLL_SECS.
+		  */
+		 cancel_delayed_work_sync(&hp_wmi_charge_poll_work);
+		 scoped_guard(mutex, &hp_wmi_charge_lock)
+			 hp_wmi_charge_end_threshold = 0;
+
+		 switch (val->intval) {
+		 case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+			 return hp_wmi_set_battery_charge_option(active_charge_params->mode_auto);
+		 case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+			 return hp_wmi_set_battery_charge_option(active_charge_params->mode_inhibit);
+		 case POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE:
+			 return hp_wmi_set_battery_charge_option(active_charge_params->mode_force_discharge);
+		 default:
+			 return -EINVAL;
+		 }
+	 case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		 if (val->intval != 100 && (val->intval < 20 || val->intval > 100))
+			 return -EINVAL;
+
+		 return hp_wmi_charge_set_threshold(val->intval == 100 ? 0 : val->intval);
+	 default:
+		 return -EINVAL;
+	 }
+ }
+
+ static int hp_wmi_charge_ext_property_is_writeable(struct power_supply *psy,
+						     const struct power_supply_ext *ext,
+						     void *data,
+						     enum power_supply_property psp)
+ {
+	 return 1;
+ }
+
+ static const struct power_supply_ext hp_wmi_charge_ext = {
+	 .name			= "hp-wmi-charge-control",
+	 .charge_behaviours	= BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+				  BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE) |
+				  BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE),
+	 .properties		= hp_wmi_charge_ext_props,
+	 .num_properties	= ARRAY_SIZE(hp_wmi_charge_ext_props),
+	 .get_property		= hp_wmi_charge_ext_get_property,
+	 .set_property		= hp_wmi_charge_ext_set_property,
+	 .property_is_writeable	= hp_wmi_charge_ext_property_is_writeable,
+ };
+
+ static int hp_wmi_charge_add_battery(struct power_supply *battery,
+				      struct acpi_battery_hook *hook)
+ {
+	 int ret;
+
+	 ret = power_supply_register_extension(battery, &hp_wmi_charge_ext,
+						&hp_wmi_platform_dev->dev, NULL);
+	 if (ret)
+		 return ret;
+
+	 scoped_guard(mutex, &hp_wmi_charge_lock)
+		 hp_wmi_charge_battery = battery;
+
+	 return 0;
+ }
+
+ static int hp_wmi_charge_remove_battery(struct power_supply *battery,
+					 struct acpi_battery_hook *hook)
+ {
+	 u8 mode;
+
+	 cancel_delayed_work_sync(&hp_wmi_charge_poll_work);
+
+	 /* Don't leave charging inhibited/discharging behind us on detach. */
+	 if (hp_wmi_get_battery_charge_option(&mode) == 0 &&
+	     mode != active_charge_params->mode_auto)
+		 hp_wmi_set_battery_charge_option(active_charge_params->mode_auto);
+
+	 power_supply_unregister_extension(battery, &hp_wmi_charge_ext);
+
+	 scoped_guard(mutex, &hp_wmi_charge_lock)
+		 hp_wmi_charge_battery = NULL;
+
+	 return 0;
+ }
+
+ static struct acpi_battery_hook hp_wmi_charge_battery_hook = {
+	 .name		= "HP WMI Charge Control",
+	 .add_battery	= hp_wmi_charge_add_battery,
+	 .remove_battery = hp_wmi_charge_remove_battery,
+ };
+
  /*
   * Calling this hp_wmi_get_fan_count_userdefine_trigger function also enables
   * and/or maintains the laptop in user defined thermal and fan states, instead
@@ -2504,15 +2823,45 @@ static bool omen_has_gpu_thermal_modes(void)
 		 return err;
  
 	 thermal_profile_setup(device);
- 
+
+	 {
+		 const struct dmi_system_id *id;
+
+		 id = dmi_first_match(hp_wmi_charge_control_quirks);
+		 if (id)
+			 active_charge_params = id->driver_data;
+	 }
+	 if (active_charge_params) {
+		 int hook_err;
+
+		 INIT_DELAYED_WORK(&hp_wmi_charge_poll_work, hp_wmi_charge_poll_fn);
+
+		 hook_err = devm_battery_hook_register(&device->dev, &hp_wmi_charge_battery_hook);
+		 if (hook_err) {
+			 pr_warn("Failed to register battery charge control hook: %d\n",
+				 hook_err);
+		 } else if (battery_charge_threshold_param >= 0) {
+			 int val = battery_charge_threshold_param;
+
+			 if (val != 0 && (val < 20 || val > 100)) {
+				 pr_warn("Ignoring invalid battery_charge_threshold=%d module parameter (must be 0 or 20-100)\n",
+					 val);
+			 } else {
+				 if (val == 100)
+					 val = 0;
+				 hp_wmi_charge_set_threshold((u8)val);
+			 }
+		 }
+	 }
+
 	 return 0;
  }
- 
+
  static void __exit hp_wmi_bios_remove(struct platform_device *device)
  {
 	 int i;
 	 struct hp_wmi_hwmon_priv *priv;
- 
+
 	 for (i = 0; i < rfkill2_count; i++) {
 		 rfkill_unregister(rfkill2[i].rfkill);
 		 rfkill_destroy(rfkill2[i].rfkill);
